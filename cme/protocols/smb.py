@@ -16,6 +16,8 @@ from impacket.dcerpc.v5.epm import MSRPC_UUID_PORTMAP
 from impacket.dcerpc.v5.dcom.wmi import WBEM_FLAG_FORWARD_ONLY
 from impacket.dcerpc.v5.samr import SID_NAME_USE
 from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
+from impacket import ntlm
+from impacket.ntlm import AV_PAIRS, NTLMSSP_AV_TIME, NTLMSSP_AV_FLAGS, NTOWFv2, NTLMSSP_AV_TARGET_NAME, NTLMSSP_AV_HOSTNAME,USE_NTLMv2, hmac_md5
 from cme.connection import *
 from cme.logger import CMEAdapter
 from cme.servers.smb import CMESMBServer
@@ -157,6 +159,9 @@ class smb(connection):
         tgroup = smb_parser.add_argument_group("Files", "Options for put and get remote files")
         tgroup.add_argument("--put-file", nargs=2, metavar="FILE", help='Put a local file into remote target, ex: whoami.txt \\\\Windows\\\\Temp\\\\whoami.txt')
         tgroup.add_argument("--get-file", nargs=2, metavar="FILE", help='Get a remote file, ex: \\\\Windows\\\\Temp\\\\whoami.txt whoami.txt')
+
+        vgroup = smb_parser.add_argument_group("Vulnerable", "Scan the juicy vulnerability")
+        vgroup.add_argument("--remove-mic", metavar='OUTPUT_FILE', help="outputs all hosts with SMB signing disabled and vulnerable to CVE-2019-1040")
 
         cgroup = smb_parser.add_argument_group("Command Execution", "Options for executing commands")
         cgroup.add_argument('--exec-method', choices={"wmiexec", "mmcexec", "smbexec", "atexec"}, default=None, help="method to execute the command. Ignored if in MSSQL mode (default: wmiexec)")
@@ -427,6 +432,52 @@ class smb(connection):
                 with open(self.args.gen_relay_list, 'a+') as relay_list:
                     if self.host not in relay_list.read():
                         relay_list.write(self.host + '\n')
+
+    # function mod_computeResponseNTLMv2 from https://github.com/fox-it/cve-2019-1040-scanner by @fox-it @dirkjanm
+    # Slightly modified version of impackets computeResponseNTLMv2
+    def mod_computeResponseNTLMv2(self, flags, serverChallenge, clientChallenge, serverName, domain, user, password, lmhash='',
+                                nthash='', use_ntlmv2=USE_NTLMv2, check=False):
+
+        responseServerVersion = b'\x01'
+        hiResponseServerVersion = b'\x01'
+        responseKeyNT = NTOWFv2(user, password, domain, nthash)
+
+        av_pairs = AV_PAIRS(serverName)
+        av_pairs[NTLMSSP_AV_TARGET_NAME] = 'cifs/'.encode('utf-16le') + av_pairs[NTLMSSP_AV_HOSTNAME][1]
+        if av_pairs[NTLMSSP_AV_TIME] is not None:
+            aTime = av_pairs[NTLMSSP_AV_TIME][1]
+        else:
+            aTime = struct.pack('<q', (116444736000000000 + calendar.timegm(time.gmtime()) * 10000000))
+            av_pairs[NTLMSSP_AV_TIME] = aTime
+        av_pairs[NTLMSSP_AV_FLAGS] = b'\x02' + b'\x00' * 3
+        serverName = av_pairs.getData()
+
+        temp = responseServerVersion + hiResponseServerVersion + b'\x00' * 6 + aTime + clientChallenge + b'\x00' * 4 + \
+            serverName + b'\x00' * 4
+
+        ntProofStr = hmac_md5(responseKeyNT, serverChallenge + temp)
+
+        ntChallengeResponse = ntProofStr + temp
+        lmChallengeResponse = hmac_md5(responseKeyNT, serverChallenge + clientChallenge) + clientChallenge
+        sessionBaseKey = hmac_md5(responseKeyNT, ntProofStr)
+
+        return ntChallengeResponse, lmChallengeResponse, sessionBaseKey
+
+    def remove_mic(self):
+        # check if SMB sign not required, check https://github.com/fox-it/cve-2019-1040-scanner/issues/7
+        if not self.signing:
+            ntlm.computeResponseNTLMv2 = self.mod_computeResponseNTLMv2
+            try:
+                self.conn.login(self.username, self.password, self.domain, self.lmhash, self.nthash)
+                self.logger.highlight('Target %s is VULNERABLE to CVE-2019-1040 (authentication was accepted)', self.host)
+            except SessionError as exc:
+                if 'STATUS_INVALID_PARAMETER' in str(exc):
+                    self.logger.debug('Target %s is not vulnerable to CVE-2019-1040 (authentication was rejected)', self.host)
+                return False
+            with sem:
+                with open(self.args.remove_mic, 'a+') as remove_mic:
+                    if self.host not in remove_mic.read():
+                        remove_mic.write(self.host + '\n')
 
     @requires_admin
     @requires_smb_server
